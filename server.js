@@ -13,8 +13,12 @@ app.use(cors());
 app.use(express.json());
 
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("DB connected"))
+  .then(() => console.log("MongoDB Connected"))
   .catch(err => console.log(err));
+
+app.get("/", (req, res) => {
+  res.send("Backend running");
+});
 
 const API_KEY = process.env.OPENAI_API_KEY;
 
@@ -202,4 +206,4 @@ app.get("/admin/export", auth, adminAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log("Server running"));
