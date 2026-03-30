@@ -5,182 +5,157 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const morgan = require("morgan");
+const compression = require("compression");
+
 const User = require("./models/User");
 const Diet = require("./models/Diet");
 
 const app = express();
+
+// --- Production Middlewares ---
+app.use(helmet()); // Secure HTTP headers
+app.use(compression()); // Gzip compression
+app.use(morgan("dev")); // Request logging
 app.use(cors());
 app.use(express.json());
 
+// API Rate Limiting (Prevents brute force & abuse)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
+  message: { error: "Too many requests, please try again later." }
+});
+app.use("/login", limiter); // Stricter limit for auth
+app.use("/register", limiter);
+
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Connected"))
-  .catch(err => console.log(err));
+  .catch(err => console.error("MongoDB Connection Error:", err));
 
 app.get("/", (req, res) => {
-  res.send("Backend running");
+  res.send("CycleSync API - Running in Production Mode");
 });
 
 const API_KEY = process.env.OPENAI_API_KEY;
 
+// --- Global Error Handler Utility ---
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
 // Authentication Middleware
 function auth(req, res, next) {
   const token = req.headers.authorization;
-
-  if (!token) return res.status(401).json({ error: "No token" });
+  if (!token) return res.status(401).json({ error: "Access denied. No token provided." });
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.userId = decoded.id;
     next();
-  } catch {
-    res.status(401).json({ error: "Invalid token" });
+  } catch (ex) {
+    res.status(400).json({ error: "Invalid token." });
   }
 }
 
 // Admin Middleware
 async function adminAuth(req, res, next) {
-  const user = await User.findById(req.userId);
-
-  if (!user || user.role !== "admin") {
-    return res.status(403).json({ error: "Not admin" });
+  try {
+    const user = await User.findById(req.userId);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ error: "Forbidden. Admin access required." });
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
-
-  next();
 }
 
 // --- Auth Routes ---
+app.post("/register", asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
-app.post("/register", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const hashed = await bcrypt.hash(password, 10);
-    
-    // Automatically set as admin for sambhavi2908@gmail.com
-    const role = email === "sambhavi2908@gmail.com" ? "admin" : "user";
-    
-    const user = await User.create({ email, password: hashed, role });
-    res.json(user);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+  const hashed = await bcrypt.hash(password, 10);
+  const role = email === "sambhavi2908@gmail.com" ? "admin" : "user";
+  
+  const user = await User.create({ email, password: hashed, role });
+  res.status(201).json({ message: "User registered", id: user._id });
+}));
 
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
+app.post("/login", asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  
+  if (!user) return res.status(400).json({ error: "Invalid email or password" });
 
-    const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ error: "User not found" });
+  const valid = await bcrypt.compare(password, user.password);
+  if (!valid) return res.status(400).json({ error: "Invalid email or password" });
 
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(400).json({ error: "Invalid password" });
+  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
+  res.json({ token, role: user.role });
+}));
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-
-    res.json({ token, role: user.role });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- Protected Routes ---
-
-function detectPattern(diet) {
-  if (diet.calories < 1200) {
-    return "Warning: Too low calorie intake detected.";
-  }
-  return null;
-}
-
-app.post("/diet", auth, async (req, res) => {
+// --- CycleSync Features ---
+app.post("/diet", auth, asyncHandler(async (req, res) => {
   const { phase, calories, likes, dislikes } = req.body;
 
-  try {
-    const response = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "user",
-            content: `Create a ${calories} kcal diet plan for ${phase}. Likes: ${likes}. Avoid: ${dislikes}`
-          }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        }
+  const response = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [{
+        role: "user",
+        content: `Create a ${calories} kcal diet plan for ${phase}. Likes: ${likes}. Avoid: ${dislikes}`
+      }]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json"
       }
-    );
+    }
+  );
 
-    const plan = response.data.choices[0].message.content;
+  const plan = response.data.choices[0].message.content;
+  const insight = calories < 1200 ? "Warning: Calorie intake is critically low." : null;
 
-    const insight = detectPattern({ calories });
+  await Diet.create({ userId: req.userId, phase, calories, plan });
+  res.json({ plan, insight });
+}));
 
-    await Diet.create({
-      userId: req.userId,
-      phase,
-      calories,
-      plan,
-    });
-
-    res.json({ plan, insight });
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/chat", auth, async (req, res) => {
+app.post("/chat", auth, asyncHandler(async (req, res) => {
   const { message } = req.body;
-
-  try {
-    const response = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "You are a health assistant." },
-          { role: "user", content: message }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json"
-        }
+  const response = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are a health assistant specializing in cycle sync health." },
+        { role: "user", content: message }
+      ]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json"
       }
-    );
+    }
+  );
+  res.json(response.data);
+}));
 
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/history", auth, async (req, res) => {
-  const diets = await Diet.find({ userId: req.userId });
+app.get("/history", auth, asyncHandler(async (req, res) => {
+  const diets = await Diet.find({ userId: req.userId }).sort({ createdAt: -1 });
   res.json(diets);
-});
+}));
 
 // --- Admin APIs ---
-
-app.get("/admin/users", auth, adminAuth, async (req, res) => {
-  const users = await User.find().select("-password");
-  res.json(users);
-});
-
-app.get("/admin/diets", auth, adminAuth, async (req, res) => {
-  const diets = await Diet.find();
-  res.json(diets);
-});
-
-app.get("/admin/analytics", auth, adminAuth, async (req, res) => {
+app.get("/admin/analytics", auth, adminAuth, asyncHandler(async (req, res) => {
   const totalUsers = await User.countDocuments();
   const totalDiets = await Diet.countDocuments();
-
   const avgCalories = await Diet.aggregate([
     { $group: { _id: null, avg: { $avg: "$calories" } } }
   ]);
@@ -190,20 +165,21 @@ app.get("/admin/analytics", auth, adminAuth, async (req, res) => {
     totalDiets,
     avgCalories: avgCalories[0]?.avg || 0
   });
-});
+}));
 
-app.get("/admin/phases", auth, adminAuth, async (req, res) => {
-  const data = await Diet.aggregate([
-    { $group: { _id: "$phase", count: { $sum: 1 } } }
-  ]);
+app.get("/admin/users", auth, adminAuth, asyncHandler(async (req, res) => {
+  const users = await User.find().select("-password");
+  res.json(users);
+}));
 
-  res.json(data);
-});
-
-app.get("/admin/export", auth, adminAuth, async (req, res) => {
-  const data = await Diet.find();
-  res.json(data);
+// --- Centralized Error Handling ---
+app.use((err, req, res, next) => {
+  console.error("PRODUCTION ERROR:", err.stack);
+  res.status(500).json({
+    error: "A server error occurred. Please try again later.",
+    message: process.env.NODE_ENV === "development" ? err.message : undefined
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running"));
+app.listen(PORT, () => console.log(`Secure Server running on port ${PORT}`));
